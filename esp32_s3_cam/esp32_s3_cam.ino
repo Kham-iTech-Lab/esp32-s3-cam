@@ -7,6 +7,9 @@
  *   - ถ่ายภาพนิ่ง ความละเอียดสูงสุด 1600x1200 (UXGA)
  *   - เปิด/ปิดไฟ LED (ถ้าบอร์ดมี)
  *   - ปรับความละเอียด กลับหัวภาพ จากหน้าเว็บ
+ *   - บันทึกภาพลง microSD กดเอง หรือถ่ายอัตโนมัติทุก 10 วิ - 30 นาที (timelapse)
+ *     ชื่อไฟล์เป็นวันเวลาจริง การ์ดใกล้เต็มจะลบรูปเก่าสุดให้เอง + หน้าดูรูปย้อนหลัง
+ *     (การ์ด microSD ไม่เกิน 32GB ฟอร์แมต FAT32 — ไม่ใส่การ์ดก็ใช้งานอื่นได้ปกติ)
  *
  * ทำไม S3 ดีกว่า ESP32-CAM: CPU เร็วกว่า, PSRAM 8MB แบบ OPI (เร็วกว่าเดิมมาก),
  * มี USB ในตัว เสียบสายอัปโหลดได้เลย ไม่ต้องต่อ IO0 / USB-TTL
@@ -31,6 +34,7 @@
 // ------------------------------------------------------------------ ตั้งค่า Wi-Fi
 const char* WIFI_SSID = "ชื่อ Wi-Fi บ้าน";
 const char* WIFI_PASS = "รหัส Wi-Fi";
+const char* TIME_ZONE = "ICT-7";       // เวลาประเทศไทย ใช้ตั้งชื่อไฟล์รูป
 
 // ------------------------------------------------------------------ ขากล้องตามบอร์ด
 #if defined(BOARD_S3_EYE)
@@ -51,6 +55,10 @@ const char* WIFI_PASS = "รหัส Wi-Fi";
   #define HREF_GPIO_NUM    7
   #define PCLK_GPIO_NUM   13
   #define LED_PIN          2    // ไฟ LED บนบอร์ด (ถ้าบอร์ดไม่มี ตั้งเป็น -1)
+  // ช่อง microSD แบบ SD_MMC 1-bit
+  #define SD_MMC_CMD      38
+  #define SD_MMC_CLK      39
+  #define SD_MMC_D0       40
 #elif defined(BOARD_XIAO_SENSE)
   #define PWDN_GPIO_NUM   -1
   #define RESET_GPIO_NUM  -1
@@ -68,10 +76,15 @@ const char* WIFI_PASS = "รหัส Wi-Fi";
   #define VSYNC_GPIO_NUM  38
   #define HREF_GPIO_NUM   47
   #define PCLK_GPIO_NUM   13
-  #define LED_PIN         21    // LED สีส้มบน XIAO (ติดเมื่อ LOW)
+  #define LED_PIN         -1    // LED บน XIAO ใช้ขา 21 ร่วมกับ SD จึงปิดไว้
+  // ช่อง microSD บนบอร์ดขยาย Sense ต่อแบบ SPI
+  #define SD_USE_SPI
+  #define SD_CS_PIN       21
 #else
   #error "เลือกบอร์ดก่อน: เปิด #define BOARD_S3_EYE หรือ BOARD_XIAO_SENSE"
 #endif
+
+#include "sd_storage.h"   // บันทึกลง microSD (ไฟล์อยู่ในโฟลเดอร์เดียวกัน)
 
 httpd_handle_t webServer = NULL;     // หน้าเว็บ + คำสั่ง (พอร์ต 80)
 httpd_handle_t streamServer = NULL;  // ภาพสด (พอร์ต 81)
@@ -87,7 +100,7 @@ void setLed(bool on) {
 }
 
 // ------------------------------------------------------------------ หน้าเว็บ
-static const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
+static const char INDEX_TOP[] PROGMEM = R"HTML(<!doctype html>
 <html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ESP32-S3-CAM</title><style>
@@ -111,7 +124,9 @@ button,select{background:#1c2b55;border:2px solid #3cc8ff;color:#fff;border-radi
     <option value="11">HD 1280x720</option>
     <option value="13">UXGA 1600x1200</option>
   </select>
-</div>
+</div>)HTML";
+// (ปุ่ม SD จาก sd_storage.h แทรกตรงนี้)
+static const char INDEX_BOTTOM[] PROGMEM = R"HTML(
 <div class="s" id="i"></div>
 <script>
 document.getElementById('v').src=location.protocol+'//'+location.hostname+':81/stream';
@@ -121,7 +136,10 @@ fetch('/info').then(r=>r.text()).then(t=>document.getElementById('i').innerText=
 
 static esp_err_t indexHandler(httpd_req_t* req) {
   httpd_resp_set_type(req, "text/html; charset=utf-8");
-  return httpd_resp_send(req, INDEX_HTML, strlen(INDEX_HTML));
+  httpd_resp_send_chunk(req, INDEX_TOP, strlen(INDEX_TOP));
+  httpd_resp_send_chunk(req, sdcam::HTML_CONTROLS, strlen(sdcam::HTML_CONTROLS));
+  httpd_resp_send_chunk(req, INDEX_BOTTOM, strlen(INDEX_BOTTOM));
+  return httpd_resp_send_chunk(req, NULL, 0);
 }
 
 static esp_err_t infoHandler(httpd_req_t* req) {
@@ -212,6 +230,7 @@ static esp_err_t streamHandler(httpd_req_t* req) {
 void startServers() {
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
   cfg.server_port = 80;
+  cfg.max_uri_handlers = 16;     // ค่าเริ่มต้นได้แค่ 8 ไม่พอสำหรับเมนู SD
   httpd_uri_t uris[] = {
     {"/",        HTTP_GET, indexHandler,   NULL},
     {"/info",    HTTP_GET, infoHandler,    NULL},
@@ -222,6 +241,7 @@ void startServers() {
   };
   if (httpd_start(&webServer, &cfg) == ESP_OK) {
     for (auto& u : uris) httpd_register_uri_handler(webServer, &u);
+    sdcam::registerHandlers(webServer);
   }
 
   cfg.server_port = 81;
@@ -237,6 +257,7 @@ void setup() {
   Serial.begin(115200);
   delay(1500);   // รอ USB Serial พร้อม
   if (LED_PIN >= 0) { pinMode(LED_PIN, OUTPUT); setLed(false); }
+  Serial.println(sdcam::begin() ? "พบการ์ด SD" : "ไม่พบการ์ด SD — ใช้งานต่อได้ แต่บันทึกภาพไม่ได้");
 
   if (!psramFound()) {
     Serial.println("ไม่เจอ PSRAM — ไปที่ Tools > PSRAM แล้วเลือก \"OPI PSRAM\" แล้วอัปโหลดใหม่");
@@ -276,10 +297,12 @@ void setup() {
   Serial.print("กำลังต่อ Wi-Fi");
   while (WiFi.status() != WL_CONNECTED) { delay(400); Serial.print("."); }
 
+  configTzTime(TIME_ZONE, "pool.ntp.org", "time.google.com");   // ดึงเวลาจริงจากอินเทอร์เน็ต
   startServers();
   Serial.printf("\nเปิดในมือถือ: http://%s\n", WiFi.localIP().toString().c_str());
 }
 
 void loop() {
-  delay(10000);   // งานทั้งหมดทำในเซิร์ฟเวอร์ ไม่ต้องทำอะไรใน loop
+  sdcam::loop();   // ถ่ายอัตโนมัติลง SD ตามรอบเวลาที่ตั้งไว้
+  delay(50);
 }
