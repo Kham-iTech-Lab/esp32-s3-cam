@@ -5,6 +5,11 @@
 
 ใช้บอร์ด ESP32-CAM ตัวเดิม (ไม่ใช่ S3)? ดู [esp32-cam-cctv](https://github.com/Kham-iTech-Lab/esp32-cam-cctv)
 
+## สั่งซื้อบอร์ด
+
+- 🛒 **ESP32-S3-CAM:** [สั่งซื้อที่ Shopee](https://s.shopee.co.th/AAHkfOsvxk)
+- 🛒 **ESP32-CAM รุ่นประหยัด:** [สั่งซื้อที่ Shopee](https://s.shopee.co.th/1AyYYjAEK) · [โค้ดสำหรับ ESP32-CAM](https://github.com/Kham-iTech-Lab/esp32-cam-cctv)
+
 ## S3 ดีกว่า ESP32-CAM ตรงไหน
 
 | | ESP32-CAM | ESP32-S3-CAM |
